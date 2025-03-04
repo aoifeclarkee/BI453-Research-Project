@@ -1,0 +1,692 @@
+---
+title: "Lung Cancer - Gender - Aoife's Project"
+author: "Aoife Clarke"
+date: "2025-02-21"
+output: html_document
+---
+
+
+```{r include=FALSE}
+#Required packages
+library(Biobase)
+library(mclust)
+library(clue)
+library(pdfCluster)
+library(NMF)
+library(funtimes)
+library(ggplot2)
+library(plotrix)
+library(fpc)
+library(cluster)
+library(aricode)
+library(dplyr)
+library(corrplot)
+library(limma)
+library(tidyr)
+library(DESeq2)
+library(kableExtra)
+library(edgeR)
+library(GEOquery)
+```
+
+```{r}
+# Download and load the dataset
+gse <- getGEO("GSE4115", GSEMatrix = TRUE)
+gse <- gse[[1]]
+```
+
+```{r}
+# Extract the expression matrix
+exprs <- exprs(gse)
+# View the dimensions of the matrix
+dim(exprs)
+```
+
+```{r}
+# Extract sample metadata
+sample_metadata <- pData(gse)
+
+# View the first few rows of the sample metadata
+list(sample_metadata)
+head(sample_metadata)
+```
+
+```{r}
+# Extract feature data
+features_data <- fData(gse)
+
+# View the first few rows of the feature data
+head(features_data)
+```
+
+```{r}
+# Check if pData is a data frame
+class(pData(gse))
+
+# Check if fData is a data frame
+class(fData(gse))
+
+
+pData_df <- as.data.frame(pData(gse))
+fData_df <- as.data.frame(fData(gse))
+
+```
+
+
+```{r}
+phenoData <- AnnotatedDataFrame(data = pData_df)
+featureData <- AnnotatedDataFrame(data = fData_df)
+```
+
+
+```{r}
+#Makes an expression set from the expression matrix, phenotype data (sample), feature data (gene)
+eset <- ExpressionSet(assayData = exprs,
+                      phenoData = phenoData,
+                      featureData = featureData)
+
+#Inspect dimensions of eset
+dim(eset)
+```
+```{r}
+#Assign the expression matrix as 'A'
+A <- exprs(eset)
+```
+
+
+```{r}
+# Data Preprocessing
+
+# Replace any NA with the average value of non-NA values across that row
+
+exprs <- t(apply(exprs, 1, function(row) {
+  missing_values <- is.na(row)
+  if (any(!missing_values)) {
+    mean_value <- mean(row[!missing_values], na.rm = TRUE)
+    row[missing_values] <- mean_value
+  }
+  return(row)
+}))
+
+# Remove all genes with zero values across the rows
+
+exprs <- exprs[apply(exprs, 1, function(row) all(row !=0 )), ]
+
+
+# Select the top 1000 most variably expressed genes
+
+exprs <- exprs[order(apply(exprs, 1, var), decreasing = TRUE)[1:1000], ]
+
+head(exprs)
+```
+
+
+```{r}
+# Verify available subtype labels
+print(unique(sample_metadata$`cancer_status:ch1`))  
+```
+```{r}
+groundtruths <- ifelse(sample_metadata$`cancer_status:ch1` == "Cancer", 1, 
+                ifelse(sample_metadata$`cancer_status:ch1` == "No Cancer", 2, NA))
+
+names(groundtruths) <- rownames(sample_metadata)
+print(table(groundtruths))
+
+```
+```{r}
+# Function to unify cluster predictions
+unify_labels <- function(predicted_clusters, groundtruths) {
+  predicted_clusters <- predicted_clusters[names(groundtruths)]
+  contingency <- table(predicted_clusters, groundtruths)
+  label_mapping <- apply(contingency, 1, function(row) {
+    if (sum(row) > 0) {
+      return(names(which.max(row)))
+    } else {
+      return(NA)
+    }
+  })
+  unified_predictions <- as.integer(label_mapping[as.character(predicted_clusters)])
+  names(unified_predictions) <- names(predicted_clusters)
+  return(unified_predictions)
+}
+```
+
+```{r}
+print(table(sample_metadata$`gender:ch1`))
+```
+```{r}
+
+exprs <- exprs[, colnames(exprs) %in% rownames(sample_metadata)]
+
+
+exprs <- exprs[, match(rownames(sample_metadata), colnames(exprs))]
+
+
+print(dim(exprs))  
+print(dim(sample_metadata))  
+
+```
+```{r}
+# Find samples with NA in cancer status
+na_samples <- rownames(sample_metadata[is.na(sample_metadata$`cancer_status:ch1`), ])
+print(na_samples)  
+```
+```{r}
+# Keep only samples that have a known cancer status
+sample_metadata <- sample_metadata[!is.na(sample_metadata$`cancer_status:ch1`), ]
+
+# Check dimensions after removing NA samples
+print(dim(sample_metadata))  
+```
+```{r}
+# Ensure exprs has only valid samples
+exprs <- exprs[, colnames(exprs) %in% rownames(sample_metadata)]
+
+# Ensure order of samples in exprs matches sample_metadata
+exprs <- exprs[, match(rownames(sample_metadata), colnames(exprs))]
+
+# Check dimensions
+print(dim(exprs))  
+print(dim(sample_metadata))  
+```
+```{r}
+# create the model matrix 
+design <- model.matrix(~ factor(sample_metadata$`gender:ch1`))
+colnames(design) <- c("Intercept", "MALE_vs_FEMALE")
+
+# Check design matrix dimensions
+print(dim(design))  
+
+
+fit <- lmFit(exprs, design)
+fit <- eBayes(fit)
+
+# Extract DEGs based on adjusted p-value and log fold change (LFC)
+deg_results <- topTable(fit, coef = "MALE_vs_FEMALE", number = Inf, adjust.method = "fdr")
+
+# Filter significant DEGs 
+degs <- deg_results[deg_results$adj.P.Val < 0.05 & abs(deg_results$logFC) > 0.5, ]
+
+# View the number of DEGs found
+dim(degs)
+list(degs)
+
+# Identify genes to remove
+genes_to_remove <- rownames(degs)
+
+# Remove DEGs from expression matrix
+filtered_exprs_gender <- exprs[!(rownames(exprs) %in% genes_to_remove), ]
+
+# Check new dimensions after filtering
+dim(filtered_exprs_gender)
+
+```
+
+```{r}
+# Perform Non-Negative Matrix Factorization (NMF)
+
+# Set the rank to the number of classes- smokers with lung cancer, smokers without lung cancer
+rank <- 2
+num_runs <- 100
+
+# Make lists for NMF results
+nmf_results_original <- list()
+nmf_results_filtered <- list()
+
+# Run NMF on original and filtered expression matrices
+for (x in 1:num_runs) {
+  nmf_result_original <- nmf(exprs, rank = rank, nrun = 1, seed = "random")
+  nmf_results_original[[as.character(x)]] <- nmf_result_original
+  
+  nmf_result_filtered <- nmf(filtered_exprs_gender, rank = rank, nrun = 1, seed = "random")
+  nmf_results_filtered[[as.character(x)]] <- nmf_result_filtered
+}
+
+```
+
+```{r}
+#Predict Clusters and Align with Groundtruths
+
+# Make lists for cluster predictions
+predictions_original <- list()
+predictions_filtered <- list()
+
+# Generate cluster assignments for each NMF run
+for (x in 1:num_runs) {
+  H_matrix <- coef(nmf_results_original[[x]])
+  cluster_predictions <- apply(H_matrix, 2, which.max)
+  names(cluster_predictions) <- colnames(exprs)
+  predictions_original[[as.character(x)]] <- unify_labels(cluster_predictions, groundtruths)
+  
+  H_matrix_filtered <- coef(nmf_results_filtered[[x]])
+  cluster_predictions_filtered <- apply(H_matrix_filtered, 2, which.max)
+  names(cluster_predictions_filtered) <- colnames(filtered_exprs_gender)
+  predictions_filtered[[as.character(x)]] <- unify_labels(cluster_predictions_filtered, groundtruths)
+}
+
+```
+
+```{r}
+# Purity
+
+#Calculate purity
+calculate_purity <- function(predicted_labels, groundtruths) {
+  contingency_table <- table(predicted_labels, groundtruths)
+  sum(apply(contingency_table, 1, max)) / length(groundtruths)
+}
+
+# Purity for each NMF run
+purity_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+purity_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+# View purity results
+summary(purity_original)
+summary(purity_filtered)
+
+```
+
+```{r}
+# Calculate mean purity and standard error
+purity_average <- list(
+  Original = mean(purity_original, na.rm = TRUE),
+  Filtered = mean(purity_filtered, na.rm = TRUE)
+)
+
+sempurity <- list(
+  Original = std.error(purity_original, na.rm = TRUE),
+  Filtered = std.error(purity_filtered, na.rm = TRUE)
+)
+
+# View average purity and standard error
+print(purity_average)
+print(sempurity)
+
+
+
+purity_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_Purity = c(mean(purity_original, na.rm = TRUE), mean(purity_filtered, na.rm = TRUE)),
+  SEM = c(std.error(purity_original, na.rm = TRUE), std.error(purity_filtered, na.rm = TRUE))
+)
+
+# View purity table
+print(purity_table)
+
+```
+
+```{r}
+# Adjusted Rand Index (ARI)
+
+# Compute ARI for each NMF run
+ARI_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+ARI_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+
+ARI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_ARI = c(mean(ARI_original, na.rm = TRUE), mean(ARI_filtered, na.rm = TRUE)),
+  SEM_ARI = c(std.error(ARI_original, na.rm = TRUE), std.error(ARI_filtered, na.rm = TRUE))
+)
+
+# View ARI table
+print(ARI_table)
+
+```
+
+```{r}
+# Keep only samples that do not have NA cancer status
+groundtruths <- groundtruths[!is.na(groundtruths)]
+
+# Check that there are no NA values
+print(sum(is.na(groundtruths)))  
+print(length(groundtruths))  
+
+```
+```{r}
+predictions_original <- lapply(predictions_original, function(pred) {
+  
+# Remove NA values and keep only valid samples
+  pred <- pred[!is.na(pred)]
+  pred <- pred[names(pred) %in% names(groundtruths)]
+  
+
+  pred <- pred[match(names(groundtruths), names(pred))]
+  
+  return(pred)
+})
+
+
+na_counts <- sapply(predictions_original, function(pred) sum(is.na(pred)))
+print(na_counts)  
+
+```
+
+
+```{r}
+# Normalised Mutual Information (NMI)
+
+# NMI for each NMF run
+NMI_original <- sapply(predictions_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+NMI_filtered <- sapply(predictions_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+
+NMI_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_NMI = c(mean(NMI_original, na.rm = TRUE), mean(NMI_filtered, na.rm = TRUE)),
+  SEM_NMI = c(std.error(NMI_original, na.rm = TRUE), std.error(NMI_filtered, na.rm = TRUE))
+)
+
+# View NMI table
+print(NMI_table)
+
+```
+
+```{r}
+# Post-processing - Normalisation
+
+# Make W and H matrices lists
+W_matrices_original <- list()
+W_matrices_filtered <- list()
+H_matrices_original <- list()
+H_matrices_filtered <- list()
+
+# Store extracted basis (W) and coefficient (H) matrices
+for (x in 1:100) {
+  W_matrices_original[[as.character(x)]] <- basis(nmf_results_original[[x]])
+  W_matrices_filtered[[as.character(x)]] <- basis(nmf_results_filtered[[x]])
+  H_matrices_original[[as.character(x)]] <- coef(nmf_results_original[[x]])
+  H_matrices_filtered[[as.character(x)]] <- coef(nmf_results_filtered[[x]])
+}
+
+# Normalise W and adjust H 
+for (x in 1:100) {
+  max_values_original <- apply(W_matrices_original[[as.character(x)]], 2, max)
+  W_matrices_original[[as.character(x)]] <- W_matrices_original[[as.character(x)]] / max_values_original
+  H_matrices_original[[as.character(x)]] <- H_matrices_original[[as.character(x)]] * max_values_original
+  
+  max_values_filtered <- apply(W_matrices_filtered[[as.character(x)]], 2, max)
+  W_matrices_filtered[[as.character(x)]] <- W_matrices_filtered[[as.character(x)]] / max_values_filtered
+  H_matrices_filtered[[as.character(x)]] <- H_matrices_filtered[[as.character(x)]] * max_values_filtered
+}
+
+```
+
+```{r}
+# Cluster Prediction from H Matrices
+
+predicted_clusters_original <- list()
+predicted_clusters_filtered <- list()
+H_clusters_original <- list()
+H_clusters_filtered <- list()
+
+# Assign samples to clusters based on H matrix values
+for (x in 1:100) {
+  H_matrix_original <- H_matrices_original[[as.character(x)]]
+  cluster_assignments_original <- apply(H_matrix_original, 2, which.max)
+  predicted_clusters_original[[as.character(x)]] <- cluster_assignments_original
+  H_clusters_original[[as.character(x)]] <- unify_labels(cluster_assignments_original, groundtruths)
+  
+  H_matrix_filtered <- H_matrices_filtered[[as.character(x)]]
+  cluster_assignments_filtered <- apply(H_matrix_filtered, 2, which.max)
+  predicted_clusters_filtered[[as.character(x)]] <- cluster_assignments_filtered
+  H_clusters_filtered[[as.character(x)]] <- unify_labels(cluster_assignments_filtered, groundtruths)
+}
+
+```
+
+
+```{r}
+# Purity- Post-processing 
+
+purity_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+purity_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) calculate_purity(pred, groundtruths) else NA
+})
+
+
+purity_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_Purity = c(mean(purity_post_original, na.rm = TRUE), mean(purity_post_filtered, na.rm = TRUE)),
+  SEM_Purity = c(std.error(purity_post_original, na.rm = TRUE), std.error(purity_post_filtered, na.rm = TRUE))
+)
+
+# View purity table
+print(purity_post_table)
+
+
+```
+
+```{r}
+# Adjusted Rand Index - Post-Processing
+
+ARI_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+ARI_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) adjustedRandIndex(pred, groundtruths) else NA
+})
+
+
+ARI_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_ARI = c(mean(ARI_post_original, na.rm = TRUE), mean(ARI_post_filtered, na.rm = TRUE)),
+  SEM_ARI = c(std.error(ARI_post_original, na.rm = TRUE), std.error(ARI_post_filtered, na.rm = TRUE))
+)
+
+# View post-processing ARI table
+print(ARI_post_table)
+
+```
+
+```{r}
+# Normalised Mutual Information - Post Processing
+
+NMI_post_original <- sapply(H_clusters_original, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+NMI_post_filtered <- sapply(H_clusters_filtered, function(pred) {
+  pred <- pred[names(groundtruths)]
+  if (length(pred) == length(groundtruths)) NMI(pred, groundtruths) else NA
+})
+
+# Calculate mean post-NMI and standard error
+NMI_post_table <- data.frame(
+  Condition = c("Original", "Filtered"),
+  Average_NMI = c(mean(NMI_post_original, na.rm = TRUE), mean(NMI_post_filtered, na.rm = TRUE)),
+  SEM_NMI = c(std.error(NMI_post_original, na.rm = TRUE), std.error(NMI_post_filtered, na.rm = TRUE))
+)
+
+# View post-processing NMI table
+print(NMI_post_table)
+
+```
+
+```{r}
+# Paired Two-Sided t-test for Purity Before and After DEG Removal
+
+prepurity_values <- unlist(purity_post_original)
+postpurity_values <- unlist(purity_post_filtered)
+
+# Ensure lengths match before performing the test
+if (length(prepurity_values) != length(postpurity_values)) 
+  
+
+# Perform paired t-test
+purity_ttest <- t.test(prepurity_values, postpurity_values, paired = TRUE, alternative = "two.sided")
+
+# Store results in a dataframe
+purity_ttest_comparison <- data.frame(
+  Condition = c("Pre-DEG Removal", "Post-DEG Removal"),
+  Average_Purity = c(mean(prepurity_values, na.rm = TRUE), mean(postpurity_values, na.rm = TRUE)),
+  SEM = c(std.error(prepurity_values), std.error(postpurity_values))
+)
+
+# Plot results
+ggplot(purity_ttest_comparison, aes(x = Condition, y = Average_Purity, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_Purity - SEM, ymax = Average_Purity + SEM), width = 0.2) +
+  labs(title = "Purity Before vs. After DEG Removal", x = "Condition", y = "Average Purity") +
+  theme_minimal()
+
+# Print test results
+print(purity_ttest)
+
+```
+
+```{r}
+# Paired Two-Sided t-test for ARI Before and After DEG Removal
+
+preari_values <- unlist(ARI_post_original)
+postari_values <- unlist(ARI_post_filtered)
+
+# Ensure lengths match before performing the test
+if (length(preari_values) != length(postari_values)) 
+
+# Perform paired t-test
+ari_ttest <- t.test(preari_values, postari_values, paired = TRUE, alternative = "two.sided")
+
+# Store results in a dataframe
+ari_ttest_comparison <- data.frame(
+  Condition = c("Pre-DEG Removal", "Post-DEG Removal"),
+  Average_ARI = c(mean(preari_values, na.rm = TRUE), mean(postari_values, na.rm = TRUE)),
+  SEM = c(std.error(preari_values), std.error(postari_values))
+)
+
+# Plot results
+ggplot(ari_ttest_comparison, aes(x = Condition, y = Average_ARI, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_ARI - SEM, ymax = Average_ARI + SEM), width = 0.2) +
+  labs(title = "ARI Before vs. After DEG Removal", x = "Condition", y = "Average ARI") +
+  theme_minimal()
+
+# Print test results
+print(ari_ttest)
+
+
+```
+
+```{r}
+# Paired Two-Sided t-test for NMI Before and After DEG Removal
+
+prenmi_values <- unlist(NMI_post_original)
+postnmi_values <- unlist(NMI_post_filtered)
+
+# Ensure lengths match before performing the test
+if (length(prenmi_values) != length(postnmi_values)) 
+
+# Perform paired t-test
+nmi_ttest <- t.test(prenmi_values, postnmi_values, paired = TRUE, alternative = "two.sided")
+
+
+nmi_ttest_comparison <- data.frame(
+  Condition = c("Pre-DEG Removal", "Post-DEG Removal"),
+  Average_NMI = c(mean(prenmi_values, na.rm = TRUE), mean(postnmi_values, na.rm = TRUE)),
+  SEM = c(std.error(prenmi_values), std.error(postnmi_values))
+)
+
+# Plot results
+ggplot(nmi_ttest_comparison, aes(x = Condition, y = Average_NMI, fill = Condition)) +
+  geom_bar(stat = "identity", position = position_dodge(), width = 0.6) +
+  geom_errorbar(aes(ymin = Average_NMI - SEM, ymax = Average_NMI + SEM), width = 0.2) +
+  labs(title = "NMI Before vs. After DEG Removal", x = "Condition", y = "Average NMI") +
+  theme_minimal()
+
+# Print test results
+print(nmi_ttest)
+
+```
+
+```{r}
+#Extract Clustering Errors from Analysis
+
+# Define the number of genes to test
+gene_counts <- seq(500, 991, by = 100)  
+
+# Make lists to store clustering errors
+clustering_errors_basic <- c()
+clustering_errors_filtered <- c()
+
+for (num_genes in gene_counts) {
+  
+
+  selected_genes <- head(order(apply(exprs, 1, var), decreasing = TRUE), num_genes)
+  exprs_subset <- exprs[selected_genes, ]
+  
+
+  selected_genes_filtered <- head(order(apply(filtered_exprs_gender, 1, var), decreasing = TRUE), num_genes)
+  exprs_filtered_subset <- filtered_exprs_gender[selected_genes_filtered, ]
+  
+# Run NMF
+  nmf_result_basic <- nmf(exprs_subset, rank = 2, nrun = 5, seed = "random")
+  nmf_result_filtered <- nmf(exprs_filtered_subset, rank = 2, nrun = 5, seed = "random")
+  
+# Get predicted cluster assignments
+  predicted_clusters_basic <- predict(nmf_result_basic)
+  predicted_clusters_filtered <- predict(nmf_result_filtered)
+  
+# Ensure predictions and groundtruths match
+  valid_indices <- which(!is.na(groundtruths))
+  groundtruths_valid <- groundtruths[valid_indices]
+  predicted_clusters_basic <- predicted_clusters_basic[valid_indices]
+  predicted_clusters_filtered <- predicted_clusters_filtered[valid_indices]
+  
+# Compute clustering error 
+  ari_basic <- adjustedRandIndex(predicted_clusters_basic, groundtruths_valid)
+  ari_filtered <- adjustedRandIndex(predicted_clusters_filtered, groundtruths_valid)
+  
+# Convert ARI to clustering error
+  clustering_errors_basic <- c(clustering_errors_basic, 1 - ari_basic)
+  clustering_errors_filtered <- c(clustering_errors_filtered, 1 - ari_filtered)
+}
+
+
+plot_data <- data.frame(
+  Number_of_Genes = rep(gene_counts, 2),
+  Errors = c(clustering_errors_basic, clustering_errors_filtered),
+  Method = rep(c("Basic NMF", "Filtered NMF"), each = length(gene_counts))
+)
+
+# Plot clustering errors
+ggplot(plot_data, aes(x = Number_of_Genes, y = Errors, color = Method, linetype = Method)) +
+  geom_line(linewidth = 1) +  
+  scale_linetype_manual(values = c("dashed", "solid")) +
+  scale_color_manual(values = c("blue", "red")) +
+  labs(title = "Clustering Errors vs. Number of Genes",
+       x = "Number of Genes",
+       y = "Clustering Errors") +
+  theme_minimal()
+
+
+```
+
